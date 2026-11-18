@@ -1,0 +1,33 @@
+# ====================================================================
+# Git Ignore Rules - Personal Finance Tracker
+# ====================================================================
+
+# Compiled Java bytecode & build outputs
+*.class
+bin/
+target/
+build/
+out/
+
+# Local database configuration containing sensitive credentials
+resources/db.properties
+
+# Environment variables and secrets
+.env
+*.env
+*.key
+*.pem
+
+# IDE & Editor files
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# Operating System & temporary files
+.DS_Store
+Thumbs.db
+*.tmp
+*.log

@@ -1,0 +1,19 @@
+# ====================================================================
+# Personal Finance Tracker - JDBC MySQL Database Configuration Template
+# ====================================================================
+# Copy this file to resources/db.properties and set your local credentials:
+#
+# Credentials can also be supplied via environment variables:
+#   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+# Or via JVM system properties:
+#   -Ddb.host=... -Ddb.user=... -Ddb.password=...
+#
+# Dedicated application user (pft_user) is recommended:
+#   db.user=pft_user
+#   db.password=PftSecure2026!
+# ====================================================================
+db.host=localhost
+db.port=3306
+db.name=personal_finance_tracker
+db.user=root
+db.password=your_mysql_password_here
