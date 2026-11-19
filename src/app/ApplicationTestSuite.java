@@ -36,6 +36,7 @@ import java.awt.Color;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.LocalDate;
 import java.util.List;
@@ -61,7 +62,7 @@ public class ApplicationTestSuite {
     public static void main(String[] args) {
         System.out.println("====================================================================");
         System.out.println("   PERSONAL FINANCE TRACKER - DUAL-TIER VERIFICATION SUITE");
-        System.out.println("   Partitioned Architecture: 44 Unit/Security Tests + 8 Live DB Tests");
+        System.out.println("   Partitioned Architecture: 44 Unit/Security Tests + 9 Live DB Tests");
         System.out.println("   Technology: Java Swing & AWT, PBKDF2, JDBC & MySQL 8.0+/9.0+");
         System.out.println("====================================================================");
 
@@ -370,9 +371,11 @@ public class ApplicationTestSuite {
                     }
                 }
 
-                // Verify bootstrap fails securely if token is not configured
+                // Subcase A: Verify bootstrap fails securely if token is not configured (unset)
                 System.clearProperty("ADMIN_BOOTSTRAP_TOKEN");
                 if (System.getenv("ADMIN_BOOTSTRAP_TOKEN") == null) {
+                    assertEquals(AdminManagementService.BootstrapStatus.TOKEN_NOT_CONFIGURED,
+                            adminManagementService.getBootstrapStatus(), "Status must be TOKEN_NOT_CONFIGURED when token is unset");
                     assertFalse(adminManagementService.isBootstrapAvailable(), "Bootstrap must be unavailable when token is unset");
                     try {
                         adminManagementService.bootstrapFirstAdmin(regularUser[0].getEmail(), "AnyToken");
@@ -382,10 +385,50 @@ public class ApplicationTestSuite {
                     }
                 }
 
+                // Subcase B: Verify bootstrap fails securely when token is blank or whitespace
+                System.setProperty("ADMIN_BOOTSTRAP_TOKEN", "   ");
+                assertEquals(AdminManagementService.BootstrapStatus.TOKEN_NOT_CONFIGURED,
+                        adminManagementService.getBootstrapStatus(), "Status must be TOKEN_NOT_CONFIGURED when token is whitespace");
+                assertFalse(adminManagementService.isBootstrapAvailable(), "Bootstrap must be unavailable when token is whitespace");
+                try {
+                    adminManagementService.bootstrapFirstAdmin(regularUser[0].getEmail(), "AnyToken");
+                    fail("Bootstrap must fail when token is whitespace");
+                } catch (SecurityException se) {
+                    assertTrue(se.getMessage().contains("ADMIN_BOOTSTRAP_TOKEN"), "Security error mentions token requirement");
+                }
+
+                System.setProperty("ADMIN_BOOTSTRAP_TOKEN", "");
+                assertEquals(AdminManagementService.BootstrapStatus.TOKEN_NOT_CONFIGURED,
+                        adminManagementService.getBootstrapStatus(), "Status must be TOKEN_NOT_CONFIGURED when token is empty");
+                assertFalse(adminManagementService.isBootstrapAvailable(), "Bootstrap must be unavailable when token is empty");
+
+                // Subcase C: Configure valid token and verify status is AVAILABLE
                 String testSecret = "SuperSecure#BootstrapToken2026";
                 System.setProperty("ADMIN_BOOTSTRAP_TOKEN", testSecret);
+                assertEquals(AdminManagementService.BootstrapStatus.AVAILABLE,
+                        adminManagementService.getBootstrapStatus(), "Status must be AVAILABLE when token is configured and 0 admins exist");
                 assertTrue(adminManagementService.isBootstrapAvailable(), "Bootstrap available with token configured");
 
+                // Subcase D: Incorrect token rejected with constant-time check
+                try {
+                    adminManagementService.bootstrapFirstAdmin(regularUser[0].getEmail(), "WrongSecretToken#9999");
+                    fail("Bootstrap must fail when wrong token is provided");
+                } catch (SecurityException se) {
+                    assertTrue(se.getMessage().contains("Invalid setup token"), "Rejection mentions invalid setup token");
+                }
+
+                // Subcase E: Empty email or token rejected
+                try {
+                    adminManagementService.bootstrapFirstAdmin("", testSecret);
+                    fail("Bootstrap must reject empty email");
+                } catch (IllegalArgumentException ignored) {}
+
+                try {
+                    adminManagementService.bootstrapFirstAdmin(regularUser[0].getEmail(), "");
+                    fail("Bootstrap must reject empty token");
+                } catch (IllegalArgumentException ignored) {}
+
+                // Subcase F: Successful initial bootstrap with valid token
                 User promoted = adminManagementService.bootstrapFirstAdmin(regularUser[0].getEmail(), testSecret);
                 assertNotNull(promoted, "Bootstrap returned promoted user");
                 assertEquals(User.ROLE_ADMIN, promoted.getRole(), "User role elevated to ADMIN");
@@ -394,14 +437,93 @@ public class ApplicationTestSuite {
             }
         });
 
-        // Test 24: Rejection of Subsequent Bootstrap Attempts
+        // Test 24: Rejection of Subsequent Bootstrap Attempts & Concurrency Protection
         runUnitTest("24. Permanent Disabling of Bootstrap Post-Setup & Invalid Token Rejection", () -> {
+            assertEquals(AdminManagementService.BootstrapStatus.ADMIN_ALREADY_EXISTS,
+                    adminManagementService.getBootstrapStatus(), "Status must be ADMIN_ALREADY_EXISTS post-setup");
             assertFalse(adminManagementService.isBootstrapAvailable(), "Bootstrap permanently disabled when admin exists");
             try {
                 adminManagementService.bootstrapFirstAdmin("alex@example.com", "SuperSecure#BootstrapToken2026");
                 fail("Should have blocked bootstrap attempt when admin already exists");
             } catch (IllegalStateException e) {
                 assertTrue(e.getMessage().contains("already been completed"), "One-time safeguard error returned");
+            }
+
+            // Subcase: Safe database disconnection handling simulation
+            UserDAO failingDAO = new UserDAO() {
+                @Override
+                public int countAdmins() throws SQLException {
+                    throw new SQLException("Simulated database connection failure");
+                }
+            };
+            AdminManagementService offlineAdminService = new AdminManagementService(failingDAO, auditLogService);
+            assertEquals(AdminManagementService.BootstrapStatus.DATABASE_UNAVAILABLE,
+                    offlineAdminService.getBootstrapStatus(), "Status must be DATABASE_UNAVAILABLE when database throws SQLException");
+            assertFalse(offlineAdminService.isBootstrapAvailable(), "isBootstrapAvailable must be false when DB is disconnected");
+
+            // Subcase: Concurrency Protection - Two simultaneous bootstrap attempts cannot create two initial administrators
+            User cand1 = authService.register("Race1", "Test", "race1" + System.currentTimeMillis() + "@tracker.com", null, null, "Pass@1234", "Pass@1234");
+            User cand2 = authService.register("Race2", "Test", "race2" + System.currentTimeMillis() + "@tracker.com", null, null, "Pass@1234", "Pass@1234");
+
+            // Temporarily demote all admins to simulate race condition from 0 admins
+            for (User u : userDAO.findAllUsers()) {
+                if (u.isAdmin()) {
+                    userDAO.updateRole(u.getUserId(), User.ROLE_USER);
+                }
+            }
+            assertEquals(0, userDAO.countAdmins(), "Zero active admins before race test");
+
+            java.util.concurrent.atomic.AtomicInteger successCount = new java.util.concurrent.atomic.AtomicInteger(0);
+            java.util.concurrent.atomic.AtomicInteger failureCount = new java.util.concurrent.atomic.AtomicInteger(0);
+            java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch doneLatch = new java.util.concurrent.CountDownLatch(2);
+
+            String testSecret = "SuperSecure#BootstrapToken2026";
+            System.setProperty("ADMIN_BOOTSTRAP_TOKEN", testSecret);
+
+            Runnable task1 = () -> {
+                try {
+                    startLatch.await();
+                    adminManagementService.bootstrapFirstAdmin(cand1.getEmail(), testSecret);
+                    successCount.incrementAndGet();
+                } catch (Exception ex) {
+                    failureCount.incrementAndGet();
+                } finally {
+                    doneLatch.countDown();
+                }
+            };
+
+            Runnable task2 = () -> {
+                try {
+                    startLatch.await();
+                    adminManagementService.bootstrapFirstAdmin(cand2.getEmail(), testSecret);
+                    successCount.incrementAndGet();
+                } catch (Exception ex) {
+                    failureCount.incrementAndGet();
+                } finally {
+                    doneLatch.countDown();
+                }
+            };
+
+            Thread t1 = new Thread(task1);
+            Thread t2 = new Thread(task2);
+            t1.start();
+            t2.start();
+            startLatch.countDown();
+            try {
+                doneLatch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {}
+
+            assertEquals(1, successCount.get(), "Exactly one concurrent bootstrap attempt must succeed");
+            assertEquals(1, failureCount.get(), "Concurrent second attempt must be blocked");
+            assertEquals(1, userDAO.countAdmins(), "Exactly one active admin in database post race condition");
+
+            // Re-assign elevatedAdmin to whichever user won the race for subsequent tests (25-27)
+            for (User u : userDAO.findAllUsers()) {
+                if (u.isAdmin()) {
+                    elevatedAdmin[0] = u;
+                    break;
+                }
             }
         });
 
@@ -717,7 +839,7 @@ public class ApplicationTestSuite {
         // -------------------------------------------------------------
         System.out.println();
         System.out.println("--------------------------------------------------------------------");
-        System.out.println(" PART B: LIVE MYSQL DATABASE INTEGRATION SUITE (8 Tests)");
+        System.out.println(" PART B: LIVE MYSQL DATABASE INTEGRATION SUITE (9 Tests)");
         System.out.println(" (Requires operational MySQL Server with valid credentials)");
         System.out.println("--------------------------------------------------------------------");
 
@@ -817,6 +939,45 @@ public class ApplicationTestSuite {
             assertTrue(indicator.isConnected(), "StatusIndicator reflected live connected state");
         });
 
+        // Test 53: Live MySQL Administrator Bootstrap & Safeguard Integrity
+        runLiveTest("53. Live MySQL Administrator Bootstrap & Safeguard Integrity", liveDbAvailable, () -> {
+            UserDAO liveUserDAO = new UserDAO();
+            AuditLogService liveAudit = new AuditLogService(new AuditLogDAO());
+            AdminManagementService liveAdminService = new AdminManagementService(liveUserDAO, liveAudit);
+
+            // Verify live database status with token unset
+            System.clearProperty("ADMIN_BOOTSTRAP_TOKEN");
+            if (System.getenv("ADMIN_BOOTSTRAP_TOKEN") == null) {
+                AdminManagementService.BootstrapStatus status = liveAdminService.getBootstrapStatus();
+                assertTrue(status == AdminManagementService.BootstrapStatus.TOKEN_NOT_CONFIGURED ||
+                           status == AdminManagementService.BootstrapStatus.ADMIN_ALREADY_EXISTS,
+                           "Live status is TOKEN_NOT_CONFIGURED or ADMIN_ALREADY_EXISTS");
+            }
+
+            // Test with configured property on live DB
+            String liveToken = "LiveSecretToken#" + System.currentTimeMillis();
+            System.setProperty("ADMIN_BOOTSTRAP_TOKEN", liveToken);
+            try {
+                int activeAdmins = liveUserDAO.countAdmins();
+                if (activeAdmins == 0) {
+                    assertEquals(AdminManagementService.BootstrapStatus.AVAILABLE,
+                            liveAdminService.getBootstrapStatus(), "Live status is AVAILABLE when 0 admins and token set");
+                    // Test wrong token rejection against live database
+                    try {
+                        liveAdminService.bootstrapFirstAdmin(liveTestEmail, "WrongLiveToken");
+                        fail("Live bootstrap must reject incorrect token");
+                    } catch (SecurityException se) {
+                        assertTrue(se.getMessage().contains("Invalid setup token"), "Live token verification enforced");
+                    }
+                } else {
+                    assertEquals(AdminManagementService.BootstrapStatus.ADMIN_ALREADY_EXISTS,
+                            liveAdminService.getBootstrapStatus(), "Live status is ADMIN_ALREADY_EXISTS when admins exist");
+                }
+            } finally {
+                System.clearProperty("ADMIN_BOOTSTRAP_TOKEN");
+            }
+        });
+
         // -------------------------------------------------------------
         // FINAL VERIFICATION SUMMARY
         // -------------------------------------------------------------
@@ -836,12 +997,12 @@ public class ApplicationTestSuite {
         System.out.println("--------------------------------------------------------------------");
 
         if (partAPassed == partATotal && liveDbAvailable && partBPassed == partBTotal) {
-            System.out.println("🎉 ALL 52 TESTS PASSED WITH 100% SUCCESS!");
+            System.out.printf("🎉 ALL %d TESTS PASSED WITH 100%% SUCCESS!%n", (partATotal + partBTotal));
             System.out.println("   BOTH OFFLINE LOGIC AND LIVE MYSQL DATABASE STORAGE FULLY VERIFIED.");
             System.out.println("====================================================================");
         } else if (partAPassed == partATotal && !liveDbAvailable) {
-            System.out.println("⚠️  PART A (44/44 UNIT TESTS) PASSED WITH 100% SUCCESS.");
-            System.out.println("⚠️  PART B (8 LIVE INTEGRATION TESTS) BLOCKED DUE TO MYSQL AUTHENTICATION.");
+            System.out.printf("⚠️  PART A (%d/%d UNIT TESTS) PASSED WITH 100%% SUCCESS.%n", partATotal, partATotal);
+            System.out.printf("⚠️  PART B (%d LIVE INTEGRATION TESTS) BLOCKED DUE TO MYSQL AUTHENTICATION.%n", partBTotal);
             System.out.println("    Live database functionality has NOT been verified against MySQL.");
             System.out.println("    Reason: " + initialProbe.sanitizedDiagnosis);
             System.out.println("    To verify live MySQL, configure credentials in resources/db.properties:");

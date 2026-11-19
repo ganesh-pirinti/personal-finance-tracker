@@ -141,15 +141,15 @@ public class SystemSecurityPanel extends JPanel {
         JPanel bootBody = new JPanel(new GridLayout(3, 1, 0, 6));
         bootBody.setOpaque(false);
 
-        JLabel l1 = new JLabel("• Production Bootstrap Token: Read dynamically from the environment variable 'ADMIN_BOOTSTRAP_TOKEN'.");
+        JLabel l1 = new JLabel("• Bootstrap Token Configuration: Read from the environment variable 'ADMIN_BOOTSTRAP_TOKEN'.");
         l1.setFont(FontManager.BODY);
         l1.setForeground(ThemeColors.TEXT_MUTED);
 
-        JLabel l2 = new JLabel("• Development Fallback Key: Set to 'ADMIN_BOOTSTRAP_2026' for academic and local evaluator demonstration.");
+        JLabel l2 = new JLabel("• Initial Setup Boundary: Permitted strictly for initial setup when zero active administrators exist.");
         l2.setFont(FontManager.BODY);
         l2.setForeground(ThemeColors.TEXT_MUTED);
 
-        JLabel l3 = new JLabel("• Elevation Process: Enter any registered user's email address and the bootstrap key to safely promote them to ADMIN.");
+        JLabel l3 = new JLabel("• Role Management: Authorized administrators promote or demote users directly via the 'User Management' tab.");
         l3.setFont(FontManager.BODY);
         l3.setForeground(ThemeColors.TEXT_MUTED);
 
@@ -237,6 +237,26 @@ public class SystemSecurityPanel extends JPanel {
     }
 
     private void showBootstrapDialog() {
+        AdminManagementService.BootstrapStatus status = adminService.getBootstrapStatus();
+        if (status == AdminManagementService.BootstrapStatus.ADMIN_ALREADY_EXISTS) {
+            JOptionPane.showMessageDialog(this,
+                "Administrator Bootstrap is permanently closed because active administrators already exist.\n\n" +
+                "To promote or demote users, please use the 'User Management' tab in this Admin Portal.",
+                "Bootstrap Completed", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        } else if (status == AdminManagementService.BootstrapStatus.TOKEN_NOT_CONFIGURED) {
+            JOptionPane.showMessageDialog(this,
+                "The ADMIN_BOOTSTRAP_TOKEN environment variable is not configured.\n" +
+                "Please configure the token before attempting bootstrap.",
+                "Token Not Configured", JOptionPane.WARNING_MESSAGE);
+            return;
+        } else if (status == AdminManagementService.BootstrapStatus.DATABASE_UNAVAILABLE) {
+            JOptionPane.showMessageDialog(this,
+                "The database is currently unreachable. Cannot perform bootstrap.",
+                "Database Unavailable", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
         JPanel panel = new JPanel(new GridLayout(4, 1, 0, 6));
         JTextField txtEmail = new JTextField();
         JPasswordField txtToken = new JPasswordField();

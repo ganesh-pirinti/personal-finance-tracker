@@ -386,40 +386,117 @@ public class LoginFrame extends JFrame {
     }
 
     private void handleBootstrapDialog() {
-        if (!adminService.isBootstrapAvailable()) {
-            JOptionPane.showMessageDialog(this,
-                "Administrator Bootstrap is currently DISABLED by security policy.\n\n" +
-                "Requirements for initial setup:\n" +
-                "1. The ADMIN_BOOTSTRAP_TOKEN environment variable must be configured.\n" +
-                "2. Zero active administrators must exist in the database.\n\n" +
-                "If an administrator already exists, further role promotions must\n" +
-                "be performed by an authorized administrator in the Admin Portal.",
-                "Bootstrap Unavailable",
-                JOptionPane.WARNING_MESSAGE);
-            return;
+        AdminManagementService.BootstrapStatus status = adminService.getBootstrapStatus();
+
+        switch (status) {
+            case DATABASE_UNAVAILABLE:
+                JOptionPane.showMessageDialog(this,
+                    "Database Offline or Unreachable\n\n" +
+                    "Cannot evaluate administrator bootstrap eligibility because the MySQL database\n" +
+                    "connection is currently unavailable or returning an error.\n\n" +
+                    "Troubleshooting Steps:\n" +
+                    "1. Verify that the MySQL service (e.g. MySQL2610) is running on port 3306.\n" +
+                    "2. Check connection settings and credentials in 'resources/db.properties'.\n" +
+                    "3. Ensure the connection indicator on this screen displays 'MySQL Online'.",
+                    "Bootstrap Unavailable — Database Offline",
+                    JOptionPane.ERROR_MESSAGE);
+                return;
+
+            case ADMIN_ALREADY_EXISTS:
+                JOptionPane.showMessageDialog(this,
+                    "Administrator Bootstrap Permanently Closed\n\n" +
+                    "An active administrator account already exists in the database.\n\n" +
+                    "Security Policy:\n" +
+                    "• The secret bootstrap mechanism is restricted to initial deployment only.\n" +
+                    "• Once the first administrator is established, the bootstrap wizard is permanently disabled.\n\n" +
+                    "To promote additional users or manage administrator permissions:\n" +
+                    "1. Sign in with your existing administrator account credentials.\n" +
+                    "2. Open the Super Admin Portal.\n" +
+                    "3. Navigate to 'User Management' to assign administrator roles.",
+                    "Bootstrap Completed — Administrator Already Exists",
+                    JOptionPane.INFORMATION_MESSAGE);
+                return;
+
+            case TOKEN_NOT_CONFIGURED:
+                JOptionPane.showMessageDialog(this,
+                    "Administrator Bootstrap Token Not Configured\n\n" +
+                    "Administrator Bootstrap is currently DISABLED because the ADMIN_BOOTSTRAP_TOKEN\n" +
+                    "environment variable has not been configured on the application process.\n\n" +
+                    "Requirements for Initial Setup:\n" +
+                    "1. Zero active administrators must exist in the database (Verified: 0 active admins).\n" +
+                    "2. The ADMIN_BOOTSTRAP_TOKEN environment variable must be set before launching.\n\n" +
+                    "How to launch with your secure token:\n" +
+                    "• In Windows PowerShell:\n" +
+                    "    $env:ADMIN_BOOTSTRAP_TOKEN = 'YourSecretTokenHere'\n" +
+                    "    .\\run.ps1\n\n" +
+                    "• Or pass directly via PowerShell parameter:\n" +
+                    "    .\\run.ps1 -BootstrapToken 'YourSecretTokenHere'\n\n" +
+                    "• In Command Prompt:\n" +
+                    "    set ADMIN_BOOTSTRAP_TOKEN=YourSecretTokenHere\n" +
+                    "    run.bat\n\n" +
+                    "• In IDE (VM Options):\n" +
+                    "    -DADMIN_BOOTSTRAP_TOKEN=YourSecretTokenHere\n\n" +
+                    "Once launched with the token configured, click this button again to complete setup.",
+                    "Bootstrap Unavailable — Configuration Required",
+                    JOptionPane.WARNING_MESSAGE);
+                return;
+
+            case AVAILABLE:
+                break;
         }
 
-        JPanel panel = new JPanel(new GridLayout(4, 1, 0, 6));
-        JTextField txtTargetEmail = new JTextField();
+        // Case 5: Initial Administrator Setup is Available
+        JPanel panel = new JPanel(new GridLayout(5, 1, 0, 6));
+        panel.setPreferredSize(new Dimension(380, 160));
+
+        JLabel lblNotice = new JLabel("<html><b>Zero active administrators detected.</b><br>Initial one-time administrator bootstrap is available.</html>");
+        lblNotice.setForeground(new Color(16, 185, 129));
+        JTextField txtTargetEmail = new JTextField(txtEmail.getText().trim());
         JPasswordField txtSecret = new JPasswordField();
 
+        panel.add(lblNotice);
         panel.add(new JLabel("User Account Email to promote to ADMINISTRATOR:"));
         panel.add(txtTargetEmail);
-        panel.add(new JLabel("Bootstrap Setup Secret Token (from ADMIN_BOOTSTRAP_TOKEN):"));
+        panel.add(new JLabel("Bootstrap Setup Secret Token:"));
         panel.add(txtSecret);
 
-        int res = JOptionPane.showConfirmDialog(this, panel, "One-Time Initial Administrator Setup", JOptionPane.OK_CANCEL_OPTION);
+        int res = JOptionPane.showConfirmDialog(this, panel, "One-Time Initial Administrator Setup", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (res == JOptionPane.OK_OPTION) {
             String email = txtTargetEmail.getText().trim();
             String secret = new String(txtSecret.getPassword()).trim();
 
+            if (email.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "Please enter the registered user account email to elevate.", "Validation Error", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            if (secret.isEmpty()) {
+                JOptionPane.showMessageDialog(this, "Please enter the bootstrap secret token.", "Validation Error", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+
             try {
                 User promoted = adminService.bootstrapFirstAdmin(email, secret);
                 JOptionPane.showMessageDialog(this,
-                    "Success! " + promoted.getFullName() + " (" + promoted.getEmail() + ") has been elevated to ADMINISTRATOR.\n" +
-                    "The bootstrap setup wizard is now permanently disabled.",
+                    "Success! Administrator Established\n\n" +
+                    "User: " + promoted.getFullName() + " (" + promoted.getEmail() + ")\n" +
+                    "Role: ADMINISTRATOR\n\n" +
+                    "The one-time bootstrap wizard is now permanently disabled.\n" +
+                    "Please sign in with your account credentials to access the Super Admin Portal.",
                     "Bootstrap Succeeded", JOptionPane.INFORMATION_MESSAGE);
                 txtEmail.setText(promoted.getEmail());
+                txtPassword.setText("");
+                txtPassword.requestFocusInWindow();
+            } catch (SecurityException ex) {
+                // Case 4: Token invalid or unauthorized
+                JOptionPane.showMessageDialog(this,
+                    "Authorization Denied: " + ex.getMessage() + "\n\n" +
+                    "Please ensure the supplied secret token exactly matches the ADMIN_BOOTSTRAP_TOKEN\n" +
+                    "configured in your application process environment.",
+                    "Bootstrap Authorization Denied", JOptionPane.ERROR_MESSAGE);
+            } catch (IllegalArgumentException ex) {
+                JOptionPane.showMessageDialog(this,
+                    ex.getMessage(),
+                    "Invalid Input", JOptionPane.WARNING_MESSAGE);
             } catch (Exception ex) {
                 JOptionPane.showMessageDialog(this,
                     "Bootstrap failed: " + ex.getMessage(),

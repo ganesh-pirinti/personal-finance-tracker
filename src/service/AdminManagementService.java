@@ -138,14 +138,30 @@ public class AdminManagementService {
     }
 
     /**
+     * Enumeration of Administrator Bootstrap Eligibility Statuses.
+     */
+    public enum BootstrapStatus {
+        AVAILABLE,
+        TOKEN_NOT_CONFIGURED,
+        ADMIN_ALREADY_EXISTS,
+        DATABASE_UNAVAILABLE
+    }
+
+    private static final Object BOOTSTRAP_LOCK = new Object();
+
+    /**
      * Resolves the configured administrator bootstrap token.
-     * Looks up environment variable ADMIN_BOOTSTRAP_TOKEN, or system property ADMIN_BOOTSTRAP_TOKEN.
-     * Returns null if unconfigured (zero hardcoded fallback secrets).
+     * Looks up environment variable ADMIN_BOOTSTRAP_TOKEN, system property ADMIN_BOOTSTRAP_TOKEN,
+     * or property admin.bootstrap.token.
+     * Returns null if unconfigured or blank (zero hardcoded fallback secrets).
      */
     public static String getBootstrapTokenConfigured() {
         String token = System.getenv("ADMIN_BOOTSTRAP_TOKEN");
         if (token == null || token.trim().isEmpty()) {
             token = System.getProperty("ADMIN_BOOTSTRAP_TOKEN");
+        }
+        if (token == null || token.trim().isEmpty()) {
+            token = System.getProperty("admin.bootstrap.token");
         }
         if (token == null || token.trim().isEmpty()) {
             return null;
@@ -154,27 +170,46 @@ public class AdminManagementService {
     }
 
     /**
+     * Evaluates comprehensive administrator bootstrap eligibility.
+     * Distinguishes between:
+     * - DATABASE_UNAVAILABLE: MySQL connection is unreachable or throwing errors
+     * - ADMIN_ALREADY_EXISTS: An active administrator already exists in database
+     * - TOKEN_NOT_CONFIGURED: ADMIN_BOOTSTRAP_TOKEN environment variable is not configured or blank
+     * - AVAILABLE: System has zero active admins and a valid bootstrap token is configured
+     */
+    public BootstrapStatus getBootstrapStatus() {
+        int adminCount;
+        try {
+            adminCount = userDAO.countAdmins();
+        } catch (SQLException | RuntimeException e) {
+            return BootstrapStatus.DATABASE_UNAVAILABLE;
+        }
+
+        if (adminCount > 0) {
+            return BootstrapStatus.ADMIN_ALREADY_EXISTS;
+        }
+
+        String token = getBootstrapTokenConfigured();
+        if (token == null || token.trim().isEmpty()) {
+            return BootstrapStatus.TOKEN_NOT_CONFIGURED;
+        }
+
+        return BootstrapStatus.AVAILABLE;
+    }
+
+    /**
      * Checks if administrator bootstrap procedure is currently available.
-     * Available ONLY when no active administrator exists in the database
-     * AND the ADMIN_BOOTSTRAP_TOKEN environment variable is explicitly configured.
+     * Available ONLY when getBootstrapStatus() returns AVAILABLE.
      */
     public boolean isBootstrapAvailable() {
-        String token = getBootstrapTokenConfigured();
-        if (token == null) {
-            return false;
-        }
-        try {
-            return userDAO.countAdmins() == 0;
-        } catch (SQLException e) {
-            return false;
-        }
+        return getBootstrapStatus() == BootstrapStatus.AVAILABLE;
     }
 
     /**
      * Controlled one-time initial administrator bootstrap procedure.
      * Accessible ONLY when no active administrator exists in the database
      * AND the ADMIN_BOOTSTRAP_TOKEN environment variable is explicitly configured.
-     * Permanently disabled once the first administrator is established.
+     * Thread-safe and permanently disabled once the first administrator is established.
      */
     public User bootstrapFirstAdmin(String email, String secretToken) throws SQLException {
         if (email == null || email.trim().isEmpty()) {
@@ -184,45 +219,50 @@ public class AdminManagementService {
             throw new IllegalArgumentException("Please enter the administrator setup secret key.");
         }
 
-        // 1. One-time restriction: Check if an active administrator already exists
-        int existingAdmins = userDAO.countAdmins();
-        if (existingAdmins > 0) {
-            auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "BLOCKED",
-                    "Bootstrap attempt blocked: an active administrator already exists. Setup wizard is permanently disabled.");
-            throw new IllegalStateException("Initial administrator setup has already been completed. Further role modifications require an authenticated administrator.");
+        synchronized (BOOTSTRAP_LOCK) {
+            // 1. One-time restriction: Check if an active administrator already exists
+            int existingAdmins = userDAO.countAdmins();
+            if (existingAdmins > 0) {
+                auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "BLOCKED",
+                        "Bootstrap attempt blocked: an active administrator already exists. Setup wizard is permanently disabled.");
+                throw new IllegalStateException("Initial administrator setup has already been completed. An active administrator already exists. Further role modifications require an authenticated administrator.");
+            }
+
+            // 2. Environment variable check: strictly require ADMIN_BOOTSTRAP_TOKEN (no hardcoded fallback)
+            String expectedToken = getBootstrapTokenConfigured();
+            if (expectedToken == null) {
+                auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "BLOCKED",
+                        "Administrator bootstrap attempted while ADMIN_BOOTSTRAP_TOKEN environment variable is not configured.");
+                throw new SecurityException("Administrator bootstrap is disabled because the ADMIN_BOOTSTRAP_TOKEN environment variable is not configured.");
+            }
+
+            // 3. Constant-time comparison to prevent timing attacks
+            byte[] expectedBytes = expectedToken.getBytes(StandardCharsets.UTF_8);
+            byte[] providedBytes = secretToken.trim().getBytes(StandardCharsets.UTF_8);
+            if (!MessageDigest.isEqual(expectedBytes, providedBytes)) {
+                auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "FAILURE",
+                        "Invalid bootstrap token attempt for email " + email);
+                throw new SecurityException("Invalid setup token. Bootstrap authorization denied.");
+            }
+
+            User target = userDAO.findByEmail(email.trim());
+            if (target == null) {
+                throw new IllegalArgumentException("No existing account found with email " + email + ". Please register first.");
+            }
+
+            boolean ok = userDAO.updateRole(target.getUserId(), User.ROLE_ADMIN);
+            if (!ok) {
+                throw new SQLException("Failed to update role in database for user " + email);
+            }
+            userDAO.updateAccountStatus(target.getUserId(), User.STATUS_ACTIVE);
+            target.setRole(User.ROLE_ADMIN);
+            target.setAccountStatus(User.STATUS_ACTIVE);
+
+            auditLogService.log(target.getUserId(), email, "BOOTSTRAP_ADMIN", "USER",
+                    String.valueOf(target.getUserId()), "SUCCESS",
+                    "Promoted user " + email + " to ADMIN via one-time bootstrap setup token.");
+
+            return target;
         }
-
-        // 2. Environment variable check: strictly require ADMIN_BOOTSTRAP_TOKEN (no hardcoded fallback)
-        String expectedToken = getBootstrapTokenConfigured();
-        if (expectedToken == null) {
-            auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "BLOCKED",
-                    "Administrator bootstrap attempted while ADMIN_BOOTSTRAP_TOKEN environment variable is not configured.");
-            throw new SecurityException("Administrator bootstrap is disabled because the ADMIN_BOOTSTRAP_TOKEN environment variable is not configured.");
-        }
-
-        // 3. Constant-time comparison to prevent timing attacks
-        byte[] expectedBytes = expectedToken.getBytes(StandardCharsets.UTF_8);
-        byte[] providedBytes = secretToken.trim().getBytes(StandardCharsets.UTF_8);
-        if (!MessageDigest.isEqual(expectedBytes, providedBytes)) {
-            auditLogService.log(0, email, "BOOTSTRAP_ADMIN", "SYSTEM", email, "FAILURE",
-                    "Invalid bootstrap token attempt for email " + email);
-            throw new SecurityException("Invalid setup token. Bootstrap authorization denied.");
-        }
-
-        User target = userDAO.findByEmail(email.trim());
-        if (target == null) {
-            throw new IllegalArgumentException("No existing account found with email " + email + ". Please register first.");
-        }
-
-        userDAO.updateRole(target.getUserId(), User.ROLE_ADMIN);
-        userDAO.updateAccountStatus(target.getUserId(), User.STATUS_ACTIVE);
-        target.setRole(User.ROLE_ADMIN);
-        target.setAccountStatus(User.STATUS_ACTIVE);
-
-        auditLogService.log(target.getUserId(), email, "BOOTSTRAP_ADMIN", "USER",
-                String.valueOf(target.getUserId()), "SUCCESS",
-                "Promoted user " + email + " to ADMIN via one-time bootstrap setup token.");
-
-        return target;
     }
 }
